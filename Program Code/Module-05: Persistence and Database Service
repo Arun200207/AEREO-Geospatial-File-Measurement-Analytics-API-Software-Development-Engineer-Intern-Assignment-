@@ -1,0 +1,187 @@
+import sqlite3
+from pathlib import Path
+from contextlib import contextmanager
+
+DB_PATH = Path("data/database/geospatial.db")
+
+
+def get_connection():
+    """Open a SQLite connection with foreign-key enforcement enabled."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    connection = sqlite3.connect(str(DB_PATH), timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+@contextmanager
+def get_db():
+    """Provide a database connection and reliably close it."""
+    connection = get_connection()
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def init_db():
+    """Create the database tables if they do not already exist."""
+    with get_db() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                file_id TEXT PRIMARY KEY,
+                original_filename TEXT NOT NULL,
+                source_format TEXT NOT NULL,
+                source_crs TEXT,
+                feature_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'uploaded',
+                created_at TEXT NOT NULL DEFAULT
+                    (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS measurements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id TEXT NOT NULL,
+                feature_index INTEGER NOT NULL,
+                source_index TEXT,
+                geometry_type TEXT,
+                source_crs TEXT,
+                measurement_crs TEXT,
+                area_m2 REAL,
+                length_m REAL,
+                area_hectares REAL,
+                measurement_status TEXT NOT NULL,
+                measurement_note TEXT,
+                FOREIGN KEY (file_id)
+                    REFERENCES files(file_id)
+                    ON DELETE CASCADE,
+                UNIQUE (file_id, feature_index)
+            )
+        """)
+
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_measurements_file_id
+            ON measurements(file_id)
+        """)
+
+    return str(DB_PATH)
+
+
+def save_file(file_record):
+    """Insert or update a file's metadata."""
+    required = ["file_id", "original_filename", "source_format"]
+    missing = [key for key in required if not file_record.get(key)]
+
+    if missing:
+        raise ValueError(f"Missing required file fields: {missing}")
+
+    with get_db() as connection:
+        connection.execute("""
+            INSERT INTO files (
+                file_id, original_filename, source_format,
+                source_crs, feature_count, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+                original_filename = excluded.original_filename,
+                source_format = excluded.source_format,
+                source_crs = excluded.source_crs,
+                feature_count = excluded.feature_count,
+                status = excluded.status
+        """, (
+            file_record["file_id"],
+            file_record["original_filename"],
+            file_record["source_format"],
+            file_record.get("source_crs"),
+            int(file_record.get("feature_count", 0)),
+            file_record.get("status", "uploaded"),
+        ))
+
+
+def save_measurements(file_id, features):
+    """Replace the stored measurements for a file with the supplied results."""
+    with get_db() as connection:
+        file_exists = connection.execute(
+            "SELECT 1 FROM files WHERE file_id = ?",
+            (file_id,)
+        ).fetchone()
+
+        if file_exists is None:
+            raise ValueError(
+                f"Cannot save measurements: file {file_id!r} is not registered."
+            )
+
+        connection.execute(
+            "DELETE FROM measurements WHERE file_id = ?",
+            (file_id,)
+        )
+
+        for feature in features:
+            connection.execute("""
+                INSERT INTO measurements (
+                    file_id, feature_index, source_index,
+                    geometry_type, source_crs, measurement_crs,
+                    area_m2, length_m, area_hectares,
+                    measurement_status, measurement_note
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                file_id,
+                int(feature["feature_index"]),
+                str(feature.get("source_index"))
+                    if feature.get("source_index") is not None else None,
+                feature.get("geometry_type"),
+                feature.get("source_crs"),
+                feature.get("measurement_crs"),
+                feature.get("area_m2"),
+                feature.get("length_m"),
+                feature.get("area_hectares"),
+                feature.get("measurement_status", "unknown"),
+                feature.get("measurement_note"),
+            ))
+
+
+def get_file(file_id):
+    """Return file metadata, or None when the file is not registered."""
+    with get_db() as connection:
+        row = connection.execute(
+            "SELECT * FROM files WHERE file_id = ?",
+            (file_id,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def get_measurements(file_id):
+    """Return all stored measurement records for a file."""
+    with get_db() as connection:
+        rows = connection.execute("""
+            SELECT
+                feature_index, source_index, geometry_type,
+                source_crs, measurement_crs, area_m2, length_m,
+                area_hectares, measurement_status, measurement_note
+            FROM measurements
+            WHERE file_id = ?
+            ORDER BY feature_index
+        """, (file_id,)).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_file_details(file_id):
+    """Return a file and its persisted measurements, or None if absent."""
+    file_record = get_file(file_id)
+
+    if file_record is None:
+        return None
+
+    file_record["measurements"] = get_measurements(file_id)
+    return file_record
