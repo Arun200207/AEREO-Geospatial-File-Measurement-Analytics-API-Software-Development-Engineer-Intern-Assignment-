@@ -1,0 +1,20 @@
+from fastapi import FastAPI
+
+app = FastAPI(
+    title="Geospatial Measurement API",
+    description=(
+        "Upload geospatial files, extract features, "
+        "calculate measurements, and analyze geospatial data."
+    ),
+    version="0.1.0",
+)
+
+
+@app.get("/health", tags=["System"])
+def health_check():
+    """Check whether the API is running."""
+    return {
+        "status": "healthy",
+        "service": "Geospatial Measurement API",
+        "version": "0.1.0",
+    }
