@@ -1,0 +1,242 @@
+import re
+import uuid
+import zipfile
+import xml.etree.ElementTree as ET
+from pathlib import Path, PurePosixPath
+
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
+
+# --- CONFIGURATION & PATHS ---
+UPLOAD_DIR = Path("data/uploads")
+
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_ZIP_ENTRIES = 1000
+MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+MAX_SINGLE_ZIP_FILE_BYTES = 100 * 1024 * 1024
+CHUNK_SIZE = 1024 * 1024
+
+
+# --- INGESTION & VALIDATION LOGIC ---
+def _validate_filename(filename: str | None) -> str:
+    if not filename or not filename.strip():
+        raise HTTPException(400, "A filename is required.")
+
+    filename = filename.replace("\\", "/").split("/")[-1]
+
+    if filename in {"", ".", ".."} or "\x00" in filename:
+        raise HTTPException(400, "Invalid filename.")
+
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".zip", ".kml"}:
+        raise HTTPException(
+            415,
+            "Unsupported file type. Upload a .zip Shapefile or .kml file."
+        )
+
+    return filename
+
+
+async def _save_upload(upload: UploadFile, destination: Path) -> int:
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while True:
+                chunk = await upload.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "Upload exceeds the 50 MB size limit.")
+
+                output.write(chunk)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload.close()
+
+    if total == 0:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(400, "The uploaded file is empty.")
+
+    return total
+
+
+def _validate_zip(path: Path) -> dict:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+
+            if len(entries) > MAX_ZIP_ENTRIES:
+                raise HTTPException(400, "ZIP contains too many entries.")
+
+            total_uncompressed = 0
+            shp_files = []
+            file_names = set()
+
+            for entry in entries:
+                raw_name = entry.filename
+                normalized = raw_name.replace("\\", "/")
+                member_path = PurePosixPath(normalized)
+
+                if (
+                    normalized.startswith("/")
+                    or re.match(r"^[a-zA-Z]:", normalized)
+                    or ".." in member_path.parts
+                ):
+                    raise HTTPException(400, "ZIP contains an unsafe file path.")
+
+                unix_mode = (entry.external_attr >> 16) & 0o170000
+                if unix_mode == 0o120000:
+                    raise HTTPException(400, "ZIP contains a symbolic link.")
+
+                if entry.is_dir():
+                    continue
+
+                name_key = normalized.casefold()
+                if name_key in file_names:
+                    raise HTTPException(400, "ZIP contains duplicate file paths.")
+                file_names.add(name_key)
+
+                if entry.flag_bits & 0x1:
+                    raise HTTPException(400, "Encrypted ZIP entries are not supported.")
+
+                if entry.file_size > MAX_SINGLE_ZIP_FILE_BYTES:
+                    raise HTTPException(413, "A ZIP entry exceeds the size limit.")
+
+                total_uncompressed += entry.file_size
+                if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
+                    raise HTTPException(413, "ZIP expands beyond the allowed size.")
+
+                if (
+                    entry.file_size > 1_000_000
+                    and entry.file_size / max(entry.compress_size, 1) > 1000
+                ):
+                    raise HTTPException(400, "ZIP contains a suspicious compression ratio.")
+
+                if normalized.lower().endswith(".shp"):
+                    shp_files.append(normalized)
+
+            if len(shp_files) != 1:
+                raise HTTPException(400, "ZIP must contain exactly one .shp file.")
+
+            shp = PurePosixPath(shp_files[0])
+            parent = str(shp.parent)
+            stem = shp.stem.casefold()
+
+            def sibling(extension: str) -> str:
+                name = f"{stem}{extension}"
+                return (f"{parent}/{name}" if parent != "." else name).casefold()
+
+            for extension in (".shx", ".dbf"):
+                if sibling(extension) not in file_names:
+                    raise HTTPException(
+                        400, f"Shapefile is missing its matching {extension} file."
+                    )
+
+            bad_file = archive.testzip()
+            if bad_file is not None:
+                raise HTTPException(400, "ZIP contains a corrupt file entry.")
+
+            return {
+                "format": "shapefile_zip",
+                "shapefile_member": shp_files[0],
+                "entry_count": len(entries),
+                "uncompressed_bytes": total_uncompressed,
+            }
+
+    except HTTPException:
+        raise
+    except (zipfile.BadZipFile, OSError, EOFError, RuntimeError):
+        raise HTTPException(400, "The uploaded ZIP is invalid or corrupted.")
+
+
+def _validate_kml(path: Path) -> dict:
+    try:
+        with path.open("rb") as source:
+            prefix = source.read(MAX_UPLOAD_BYTES + 1)
+
+        upper_prefix = prefix.upper()
+        if b"<!DOCTYPE" in upper_prefix or b"<!ENTITY" in upper_prefix:
+            raise HTTPException(400, "KML DTD and entity declarations are not supported.")
+
+        root = ET.fromstring(prefix)
+        root_name = root.tag.rsplit("}", 1)[-1].lower()
+
+        if root_name != "kml":
+            raise HTTPException(400, "The XML document root must be a KML element.")
+
+        return {"format": "kml"}
+
+    except HTTPException:
+        raise
+    except (ET.ParseError, OSError, ValueError):
+        raise HTTPException(400, "The uploaded KML is malformed or unreadable.")
+
+
+async def ingest_upload(upload: UploadFile) -> dict:
+    filename = _validate_filename(upload.filename)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    file_id = str(uuid.uuid4())
+    suffix = Path(filename).suffix.lower()
+    destination = UPLOAD_DIR / f"{file_id}{suffix}"
+
+    try:
+        size_bytes = await _save_upload(upload, destination)
+
+        if suffix == ".zip":
+            details = _validate_zip(destination)
+        else:
+            details = _validate_kml(destination)
+
+        return {
+            "file_id": file_id,
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "status": "accepted",
+            "storage_path": str(destination),
+            **details,
+        }
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+# --- ROUTER CONFIGURATION ---
+router = APIRouter(prefix="/api", tags=["Geospatial Files"])
+
+
+@router.post("/files/", status_code=201)
+async def upload_file(file: UploadFile = File(...)):
+    """Validate and accept a ZIP Shapefile or KML upload."""
+    result = await ingest_upload(file)
+
+    # Keep internal storage paths out of the public API response.
+    result.pop("storage_path", None)
+
+    return result
+
+
+# --- FASTAPI APPLICATION ---
+app = FastAPI(
+    title="Geospatial Measurement API",
+    description=(
+        "Upload geospatial files, extract features, "
+        "calculate measurements, and analyze geospatial data."
+    ),
+    version="0.1.0",
+)
+
+app.include_router(router)
+
+
+@app.get("/health", tags=["System"])
+def health_check():
+    """Check whether the API is running."""
+    return {
+        "status": "healthy",
+        "service": "Geospatial Measurement API",
+        "version": "0.1.0",
+    }
