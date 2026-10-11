@@ -1,0 +1,231 @@
+import math
+from typing import Any
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from pyproj import CRS
+from shapely.geometry import (
+    Polygon,
+    MultiPolygon,
+    LineString,
+    MultiLineString,
+    Point,
+    MultiPoint,
+)
+from fastapi import APIRouter, HTTPException
+
+from app.services.feature_extraction import _load_geodata
+
+AREA_TYPES = (Polygon, MultiPolygon)
+LENGTH_TYPES = (LineString, MultiLineString)
+POINT_TYPES = (Point, MultiPoint)
+
+
+def _json_number(value):
+    """Return a finite Python float or None."""
+    if value is None:
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _choose_measurement_crs(geometry, source_crs):
+    """Select local metric UTM only for suitably local geometries."""
+    if source_crs is None:
+        raise ValueError("missing_crs")
+
+    source = CRS.from_user_input(source_crs)
+
+    geographic_gdf = gpd.GeoDataFrame(
+        {"_feature": [1]},
+        geometry=[geometry],
+        crs=source,
+    ).to_crs("EPSG:4326")
+
+    minx, miny, maxx, maxy = map(float, geographic_gdf.total_bounds)
+
+    if not all(math.isfinite(v) for v in (minx, miny, maxx, maxy)):
+        raise ValueError("invalid_bounds")
+
+    if miny < -80 or maxy > 84:
+        raise ValueError("outside_utm_latitude_range")
+
+    if maxx - minx > 6:
+        raise ValueError("extent_too_large_or_crosses_utm_zones")
+
+    if maxy - miny > 8:
+        raise ValueError("extent_too_large_for_local_utm")
+
+    if maxx - minx > 180:
+        raise ValueError("antimeridian_crossing_not_supported")
+
+    estimated = geographic_gdf.estimate_utm_crs()
+    if estimated is None:
+        raise ValueError("could_not_estimate_projected_crs")
+
+    target = CRS.from_user_input(estimated)
+    if not target.is_projected:
+        raise ValueError("selected_crs_is_not_projected")
+
+    axes = target.axis_info
+    if not axes or any(
+        not math.isclose(axis.unit_conversion_factor, 1.0, rel_tol=1e-9)
+        for axis in axes[:2]
+    ):
+        raise ValueError("selected_crs_does_not_use_metres")
+
+    return target
+
+
+def measure_geodataframe(gdf: gpd.GeoDataFrame) -> dict:
+    """Measure eligible geometries and return JSON-serializable results."""
+    if not isinstance(gdf, gpd.GeoDataFrame):
+        raise TypeError("Input must be a GeoPandas GeoDataFrame.")
+
+    if gdf.geometry.name not in gdf.columns:
+        raise ValueError("Input GeoDataFrame has no geometry column.")
+
+    source_crs = gdf.crs
+    source_crs_text = str(source_crs) if source_crs is not None else None
+
+    results = []
+
+    for position, (index, row) in enumerate(gdf.iterrows()):
+        geometry = row[gdf.geometry.name]
+
+        result = {
+            "feature_index": position,
+            "source_index": str(index),
+            "geometry_type": (
+                getattr(geometry, "geom_type", None)
+                if geometry is not None else None
+            ),
+            "source_crs": source_crs_text,
+            "measurement_crs": None,
+            "area_m2": None,
+            "length_m": None,
+            "area_hectares": None,
+            "measurement_status": None,
+            "measurement_note": None,
+        }
+
+        if geometry is None:
+            result["measurement_status"] = "skipped"
+            result["measurement_note"] = "null_geometry"
+            results.append(result)
+            continue
+
+        if geometry.is_empty:
+            result["measurement_status"] = "skipped"
+            result["measurement_note"] = "empty_geometry"
+            results.append(result)
+            continue
+
+        if not geometry.is_valid:
+            result["measurement_status"] = "skipped"
+            result["measurement_note"] = "invalid_geometry"
+            results.append(result)
+            continue
+
+        if isinstance(geometry, POINT_TYPES):
+            result["measurement_status"] = "not_applicable"
+            result["measurement_note"] = "point_has_no_area_or_length"
+            results.append(result)
+            continue
+
+        if not isinstance(geometry, AREA_TYPES + LENGTH_TYPES):
+            result["measurement_status"] = "unsupported"
+            result["measurement_note"] = "unsupported_geometry_type"
+            results.append(result)
+            continue
+
+        if source_crs is None:
+            result["measurement_status"] = "skipped"
+            result["measurement_note"] = "missing_crs"
+            results.append(result)
+            continue
+
+        try:
+            target_crs = _choose_measurement_crs(geometry, source_crs)
+            projected = gpd.GeoSeries(
+                [geometry], crs=source_crs
+            ).to_crs(target_crs)
+            projected_geometry = projected.iloc[0]
+
+            if projected_geometry is None or projected_geometry.is_empty:
+                raise ValueError("geometry_empty_after_projection")
+
+            if not projected_geometry.is_valid:
+                result["measurement_status"] = "skipped"
+                result["measurement_note"] = "invalid_after_projection"
+                results.append(result)
+                continue
+
+            result["measurement_crs"] = target_crs.to_string()
+
+            if isinstance(geometry, AREA_TYPES):
+                area = _json_number(projected_geometry.area)
+                if area is None or area < 0:
+                    raise ValueError("invalid_area_result")
+
+                result["area_m2"] = area
+                result["area_hectares"] = area / 10000.0
+                result["measurement_status"] = "success"
+                result["measurement_note"] = "area_calculated_in_projected_crs"
+
+            elif isinstance(geometry, LENGTH_TYPES):
+                length = _json_number(projected_geometry.length)
+                if length is None or length < 0:
+                    raise ValueError("invalid_length_result")
+
+                result["length_m"] = length
+                result["measurement_status"] = "success"
+                result["measurement_note"] = "length_calculated_in_projected_crs"
+
+        except Exception as exc:
+            reason = str(exc) or type(exc).__name__
+            result["measurement_status"] = "skipped"
+            result["measurement_note"] = reason
+
+        results.append(result)
+
+    summary = {
+        "feature_count": len(results),
+        "successful_measurements": sum(
+            r["measurement_status"] == "success" for r in results
+        ),
+        "skipped_measurements": sum(
+            r["measurement_status"] == "skipped" for r in results
+        ),
+        "not_applicable_measurements": sum(
+            r["measurement_status"] == "not_applicable" for r in results
+        ),
+        "unsupported_measurements": sum(
+            r["measurement_status"] == "unsupported" for r in results
+        ),
+        "area_unit": "square metres",
+        "length_unit": "metres",
+        "features": results,
+    }
+
+    return summary
+
+
+# --- FASTAPI ROUTER ---
+router = APIRouter(prefix="/api/files", tags=["Measurements"])
+
+
+@router.get("/{file_id}/measurements/")
+def get_file_measurements(file_id: str):
+    """Calculate area/length measurements for an uploaded geospatial file."""
+    gdf, source_format = _load_geodata(file_id)
+
+    result = measure_geodataframe(gdf)
+
+    return {
+        "file_id": file_id,
+        "source_format": source_format,
+        "source_crs": str(gdf.crs) if gdf.crs is not None else None,
+        **result,
+    }
