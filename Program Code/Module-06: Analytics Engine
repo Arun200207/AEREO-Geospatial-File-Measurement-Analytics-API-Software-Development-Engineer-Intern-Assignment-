@@ -1,0 +1,251 @@
+import math
+from collections import Counter
+from statistics import mean, median, pstdev
+
+import numpy as np
+from fastapi import APIRouter, HTTPException
+
+from app.services.database import get_file, get_measurements
+
+
+AREA_GEOMETRIES = {"Polygon", "MultiPolygon"}
+LENGTH_GEOMETRIES = {"LineString", "MultiLineString"}
+POINT_GEOMETRIES = {"Point", "MultiPoint"}
+
+
+def _finite_number(value):
+    """Return a finite float, or None for missing/invalid numeric values."""
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    return number if math.isfinite(number) else None
+
+
+def _round_or_none(value, digits=6):
+    """Round a numeric result while keeping JSON output safe."""
+    number = _finite_number(value)
+    return round(number, digits) if number is not None else None
+
+
+def _numeric_profile(records, metric_name, unit):
+    """Summarize a measurement field and identify IQR outliers."""
+    observations = []
+
+    for record in records:
+        value = _finite_number(record.get(metric_name))
+        if value is not None:
+            observations.append({
+                "feature_index": record.get("feature_index"),
+                "value": value,
+            })
+
+    values = [item["value"] for item in observations]
+    count = len(values)
+
+    result = {
+        "metric": metric_name,
+        "unit": unit,
+        "count": count,
+        "missing_count": len(records) - count,
+        "mean": None,
+        "median": None,
+        "standard_deviation": None,
+        "minimum": None,
+        "maximum": None,
+        "q1": None,
+        "q3": None,
+        "iqr": None,
+        "lower_fence": None,
+        "upper_fence": None,
+        "outlier_count": 0,
+        "outliers": [],
+        "outlier_method": "IQR (1.5 × IQR fences)",
+        "outlier_detection_note": None,
+    }
+
+    if count == 0:
+        result["outlier_detection_note"] = (
+            "No valid numeric measurements are available."
+        )
+        return result
+
+    q1, q3 = np.percentile(values, [25, 75], method="linear")
+    iqr = float(q3 - q1)
+    lower_fence = float(q1 - 1.5 * iqr)
+    upper_fence = float(q3 + 1.5 * iqr)
+
+    result.update({
+        "mean": _round_or_none(mean(values)),
+        "median": _round_or_none(median(values)),
+        "standard_deviation": _round_or_none(pstdev(values)),
+        "minimum": _round_or_none(min(values)),
+        "maximum": _round_or_none(max(values)),
+        "q1": _round_or_none(q1),
+        "q3": _round_or_none(q3),
+        "iqr": _round_or_none(iqr),
+        "lower_fence": _round_or_none(lower_fence),
+        "upper_fence": _round_or_none(upper_fence),
+    })
+
+    for item in observations:
+        value = item["value"]
+        reason = None
+
+        if value < lower_fence:
+            reason = "below_lower_iqr_fence"
+        elif value > upper_fence:
+            reason = "above_upper_iqr_fence"
+
+        if reason:
+            result["outliers"].append({
+                "feature_index": item["feature_index"],
+                "value": _round_or_none(value),
+                "unit": unit,
+                "reason": reason,
+                "lower_fence": _round_or_none(lower_fence),
+                "upper_fence": _round_or_none(upper_fence),
+            })
+
+    result["outlier_count"] = len(result["outliers"])
+
+    if count < 4:
+        result["outlier_detection_note"] = (
+            "Fewer than four valid observations; interpret IQR flags "
+            "cautiously because the sample is small."
+        )
+    elif iqr == 0:
+        result["outlier_detection_note"] = (
+            "IQR is zero. Values differing from the repeated quartile "
+            "value may be flagged; review the data before drawing conclusions."
+        )
+    else:
+        result["outlier_detection_note"] = (
+            "Values outside the IQR fences are potential statistical "
+            "outliers, not necessarily data errors."
+        )
+
+    return result
+
+
+def profile_measurements(file_id, measurements):
+    """Build a statistical and data-quality profile from stored measurements."""
+    records = list(measurements or [])
+
+    geometry_counts = Counter(
+        record.get("geometry_type") or "Unknown"
+        for record in records
+    )
+
+    status_counts = Counter(
+        record.get("measurement_status") or "unknown"
+        for record in records
+    )
+
+    polygon_records = [
+        record for record in records
+        if record.get("geometry_type") in AREA_GEOMETRIES
+    ]
+
+    line_records = [
+        record for record in records
+        if record.get("geometry_type") in LENGTH_GEOMETRIES
+    ]
+
+    point_count = sum(
+        geometry_counts.get(name, 0)
+        for name in POINT_GEOMETRIES
+    )
+
+    skipped_count = sum(
+        count for status, count in status_counts.items()
+        if status in {"skipped", "failed", "error"}
+    )
+
+    unsupported_count = status_counts.get("unsupported", 0)
+    not_applicable_count = status_counts.get("not_applicable", 0)
+
+    area_missing_count = sum(
+        1 for record in polygon_records
+        if _finite_number(record.get("area_m2")) is None
+    )
+
+    length_missing_count = sum(
+        1 for record in line_records
+        if _finite_number(record.get("length_m")) is None
+    )
+
+    area_profile = _numeric_profile(polygon_records, "area_m2", "m²")
+    length_profile = _numeric_profile(line_records, "length_m", "m")
+
+    all_outliers = []
+    for profile in (area_profile, length_profile):
+        for outlier in profile["outliers"]:
+            all_outliers.append({
+                **outlier,
+                "metric": profile["metric"],
+            })
+
+    return {
+        "file_id": file_id,
+        "feature_count": len(records),
+        "geometry_type_counts": dict(sorted(geometry_counts.items())),
+        "measurement_status_counts": dict(sorted(status_counts.items())),
+        "data_quality": {
+            "skipped_measurements": skipped_count,
+            "unsupported_measurements": unsupported_count,
+            "not_applicable_measurements": not_applicable_count,
+            "polygon_features_missing_area": area_missing_count,
+            "line_features_missing_length": length_missing_count,
+            "point_features": point_count,
+            "quality_notes": [
+                "Points normally have no area or length measurement.",
+                "Missing measurements should be interpreted alongside "
+                "geometry type and measurement status.",
+                "Statistical outliers require review and are not automatically "
+                "classified as errors.",
+            ],
+        },
+        "statistics": {
+            "area_m2": area_profile,
+            "length_m": length_profile,
+        },
+        "anomaly_detection": {
+            "method": "Interquartile Range (IQR)",
+            "fence_multiplier": 1.5,
+            "outlier_count": len(all_outliers),
+            "outliers": all_outliers,
+        },
+    }
+
+
+# --- FASTAPI ANALYTICS ROUTER ---
+router = APIRouter(prefix="/api/files", tags=["Analytics"])
+
+
+@router.get("/{file_id}/analytics/")
+def get_file_analytics(file_id: str):
+    """Return statistical profiling, data quality, and IQR anomalies."""
+    file_record = get_file(file_id)
+
+    if file_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="File record not found. Upload and register the file first."
+        )
+
+    measurements = get_measurements(file_id)
+
+    result = profile_measurements(file_id, measurements)
+
+    return {
+        **result,
+        "source_format": file_record["source_format"],
+        "source_crs": file_record["source_crs"],
+        "file_status": file_record["status"],
+        "created_at": file_record["created_at"],
+    }
