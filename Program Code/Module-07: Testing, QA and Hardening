@@ -1,0 +1,192 @@
+# CELL 1 — Module-07: Testing and QA Setup & Execution
+
+import os
+import sys
+import uuid
+import json
+import zipfile
+from io import BytesIO
+from pathlib import Path
+from fastapi.testclient import TestClient
+
+# Ensure project root is in path
+PROJECT_DIR = Path("/content/geospatial-measurement-api")
+os.chdir(PROJECT_DIR)
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from app.main import app
+from app.services.database import init_db, get_db, get_file, get_measurements
+from app.services.analytics import profile_measurements
+from app.services.measurement import measure_geodataframe
+import geopandas as gpd
+from shapely.geometry import Polygon, LineString, Point
+
+client = TestClient(app)
+
+print("=" * 60)
+print("STARTING MODULE-07: COMPREHENSIVE TESTING & QA SUITE")
+print("=" * 60)
+
+# Initialize Database for testing
+init_db()
+
+passed_tests = 0
+failed_tests = 0
+
+def run_test(test_name, test_func):
+    global passed_tests, failed_tests
+    try:
+        test_func()
+        print(f"[PASS] {test_name}")
+        passed_tests += 1
+    except Exception as e:
+        print(f"[FAIL] {test_name} -> {e}")
+        failed_tests += 1
+        raise e
+
+
+# --- TEST 1: System Health Check ---
+def test_health_endpoint():
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "healthy"
+
+run_test("1. System Health Check Endpoint", test_health_endpoint)
+
+
+# --- TEST 2: Ingestion & Validation (Module 02) ---
+def test_ingestion_valid_kml():
+    kml_content = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <kml xmlns="http://www.opengis.net/kml/2.2">
+      <Document>
+        <Placemark>
+          <name>QA Test Polygon</name>
+          <Polygon>
+            <outerBoundaryIs>
+              <LinearRing>
+                <coordinates>
+                  78.4860,17.3850,0
+                  78.4870,17.3850,0
+                  78.4870,17.3860,0
+                  78.4860,17.3860,0
+                  78.4860,17.3850,0
+                </coordinates>
+              </LinearRing>
+            </outerBoundaryIs>
+          </Polygon>
+        </Placemark>
+      </Document>
+    </kml>
+    """
+    response = client.post(
+        "/api/files/",
+        files={"file": ("qa_test.kml", kml_content, "application/vnd.google-earth.kml+xml")},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert "file_id" in data
+    assert data["format"] == "kml"
+    
+    # Store file_id globally for downstream tests
+    global test_file_id
+    test_file_id = data["file_id"]
+
+run_test("2. Ingestion Service - Valid KML Upload", test_ingestion_valid_kml)
+
+
+# --- TEST 3: Ingestion Edge Cases & Error Handling ---
+def test_ingestion_errors():
+    # Unsupported extension
+    resp_ext = client.post("/api/files/", files={"file": ("test.txt", b"hello", "text/plain")})
+    assert resp_ext.status_code == 415
+
+    # Malformed KML
+    resp_kml = client.post("/api/files/", files={"file": ("bad.kml", b"<kml><unclosed>", "application/xml")})
+    assert resp_kml.status_code == 400
+
+    # Corrupt ZIP
+    resp_zip = client.post("/api/files/", files={"file": ("bad.zip", b"not-a-zip", "application/zip")})
+    assert resp_zip.status_code == 400
+
+run_test("3. Ingestion Error Handling (415 & 400 responses)", test_ingestion_errors)
+
+
+# --- TEST 4: Measurement & CRS Engine (Module 04) ---
+def test_measurement_engine_logic():
+    gdf = gpd.GeoDataFrame(
+        {"name": ["Square", "Path"]},
+        geometry=[
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+            LineString([(0, 0), (0, 1)])
+        ],
+        crs="EPSG:4326"
+    )
+    result = measure_geodataframe(gdf)
+    assert result["feature_count"] == 2
+    assert result["successful_measurements"] == 2
+    
+    features = result["features"]
+    poly_res = next(f for f in features if f["geometry_type"] == "Polygon")
+    line_res = next(f for f in features if f["geometry_type"] == "LineString")
+    
+    assert poly_res["area_m2"] > 0
+    assert poly_res["measurement_crs"] is not None
+    assert line_res["length_m"] > 0
+
+run_test("4. Measurement & Local UTM CRS Engine", test_measurement_engine_logic)
+
+
+# --- TEST 5: Database Persistence & Retrieval (Module 05) ---
+def test_database_persistence():
+    global test_file_id
+    # Trigger measurement calculation endpoint which persists results to SQLite
+    meas_response = client.get(f"/api/files/{test_file_id}/measurements/")
+    assert meas_response.status_code == 200
+    
+    # Retrieve file details route
+    details_response = client.get(f"/api/files/{test_file_id}/")
+    assert details_response.status_code == 200
+    details = details_response.json()
+    
+    assert details["file_id"] == test_file_id
+    assert details["status"] == "measured"
+    assert len(details["measurements"]) == 1
+
+run_test("5. Database Persistence & File Details API", test_database_persistence)
+
+
+# --- TEST 6: Analytics Engine & IQR Anomaly Detection (Module 06) ---
+def test_analytics_profiling():
+    global test_file_id
+    analytics_response = client.get(f"/api/files/{test_file_id}/analytics/")
+    assert analytics_response.status_code == 200
+    analytics_data = analytics_response.json()
+    
+    assert "geometry_type_counts" in analytics_data
+    assert "statistics" in analytics_data
+    assert "anomaly_detection" in analytics_data
+    assert analytics_data["feature_count"] >= 1
+
+run_test("6. Analytics Engine & Statistical Profiling API", test_analytics_profiling)
+
+
+# --- TEST 7: 404 Error Handling for Non-existent Files ---
+def test_nonexistent_file_handling():
+    fake_id = str(uuid.uuid4())
+    assert client.get(f"/api/files/{fake_id}/").status_code == 404
+    assert client.get(f"/api/files/{fake_id}/measurements/").status_code == 400 or client.get(f"/api/files/{fake_id}/measurements/").status_code == 404
+    assert client.get(f"/api/files/{fake_id}/analytics/").status_code == 404
+
+run_test("7. Resource Not Found (404) Handling", test_nonexistent_file_handling)
+
+
+# --- SUMMARY REPORT ---
+print("=" * 60)
+print(f"MODULE-07 QA TEST SUMMARY:")
+print(f"Total Tests Passed : {passed_tests}")
+print(f"Total Tests Failed : {failed_tests}")
+print("=" * 60)
+assert failed_tests == 0, "Some tests failed! Review the logs above."
+print("ALL MODULE-07 QA TESTS COMPLETED SUCCESSFULLY!")
